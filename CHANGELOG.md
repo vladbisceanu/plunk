@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.15.0](https://github.com/useplunk/plunk/compare/v0.14.0...v0.15.0) (2026-08-24)
+
+
+### Features
+
+* Add dedicated events for contact.subscribe and contact.unsubscribe ([ab4a48b](https://github.com/useplunk/plunk/commit/ab4a48b347ab196d5af4655e3aa7d75e1a06e580))
+* Add improved tracking for unsubscribes and complaints ([37626cb](https://github.com/useplunk/plunk/commit/37626cb5d5a0a208ed0bc6a2ab1bd4d3be2731ef))
+
+
+### Bug Fixes
+
+* Historical backfill of campaign data and improvements to handling ([2211b25](https://github.com/useplunk/plunk/commit/2211b25c7b8f2586e84bcdd3dae1e9a5ad5c8dff))
+* Incrementation on send for stats ([319cee9](https://github.com/useplunk/plunk/commit/319cee92ca8ba448be7d41e1c46714d1a48a351e))
+* Remove lock_timeout from migration ([df7afd8](https://github.com/useplunk/plunk/commit/df7afd8d04b78b71193239a7a3356eeda5bd698c))
+
+
+### Code Refactoring
+
+* Redesign domain settings for clearer and smoother setup ([2e90539](https://github.com/useplunk/plunk/commit/2e9053949568e25b26613d3fc6fb59104d19d338))
+
 ## [0.14.0](https://github.com/useplunk/plunk/compare/v0.13.0...v0.14.0) (2026-08-17)
 
 
