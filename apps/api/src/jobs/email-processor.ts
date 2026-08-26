@@ -98,6 +98,24 @@ function isExplicitlyRetryableSesFailure(error: unknown): boolean {
   );
 }
 
+type SesAcceptance = {messageId: string; sentAt: Date};
+
+async function checkpointSesAcceptance(job: Job<SendEmailJobData>, accepted: SesAcceptance): Promise<boolean> {
+  try {
+    await job.updateData({
+      ...job.data,
+      acceptedBySes: {
+        messageId: accepted.messageId,
+        sentAt: accepted.sentAt.toISOString(),
+      },
+    });
+    return true;
+  } catch (error) {
+    signale.error(`[EMAIL-PROCESSOR] Failed to checkpoint SES acceptance for ${job.data.emailId}:`, error);
+    return false;
+  }
+}
+
 /**
  * Re-read subscription state at the last possible point before handing a
  * marketing email to SES. The email may have waited in Redis after the earlier
@@ -182,12 +200,28 @@ export async function createEmailWorker() {
         throw new Error(`Email ${emailId} not found`);
       }
 
-      if (email.status !== EmailStatus.PENDING) {
+      const recoveredAcceptance = job.data.acceptedBySes
+        ? {
+            messageId: job.data.acceptedBySes.messageId,
+            sentAt: new Date(job.data.acceptedBySes.sentAt),
+          }
+        : undefined;
+
+      if (email.status === EmailStatus.SENDING && !recoveredAcceptance) {
+        const message = 'Previous attempt ended without an SES acceptance checkpoint; not retried to avoid a duplicate';
+        await prisma.email.update({
+          where: {id: emailId},
+          data: {status: EmailStatus.FAILED, error: message},
+        });
+        throw new UnrecoverableError(message);
+      }
+
+      if (email.status !== EmailStatus.PENDING && !(email.status === EmailStatus.SENDING && recoveredAcceptance)) {
         return;
       }
 
       // Check if project is disabled
-      if (email.project.disabled) {
+      if (email.project.disabled && !recoveredAcceptance) {
         signale.warn(`[EMAIL-PROCESSOR] Project ${email.projectId} is disabled, cancelling email ${emailId}`);
         await prisma.email.update({
           where: {id: emailId},
@@ -205,7 +239,9 @@ export async function createEmailWorker() {
         return;
       }
 
-      let acceptedBySes: {messageId: string; sentAt: Date} | undefined;
+      let acceptedBySes: SesAcceptance | undefined = recoveredAcceptance;
+      let acceptedPersisted = email.sentAt !== null;
+      let acceptanceCheckpointed = recoveredAcceptance !== undefined;
       let sesSubmissionStarted = false;
 
       try {
@@ -285,75 +321,78 @@ export async function createEmailWorker() {
         // Determine tracking based on project settings and email type
         const shouldTrack = EmailService.shouldTrackEmail(email.project.tracking, email.sourceType);
 
-        // Check for phishing/dangerous content before sending
-        const phishingCheck = await SecurityService.checkPhishingContent(
-          email.projectId,
-          email.project.name,
-          email.from,
-          formattedEmail.subject,
-          compiledHtml,
-        );
-
-        if (phishingCheck.shouldDisable) {
-          // Disable project immediately
-          await SecurityService.disableProjectForPhishing(
+        if (!acceptedBySes) {
+          // Check for phishing/dangerous content before sending
+          const phishingCheck = await SecurityService.checkPhishingContent(
             email.projectId,
+            email.project.name,
+            email.from,
             formattedEmail.subject,
-            phishingCheck.confidence,
-            'Phishing content detected',
+            compiledHtml,
           );
 
-          // Mark email as failed
-          await prisma.email.update({
-            where: {id: emailId},
-            data: {
-              status: EmailStatus.FAILED,
-              error: 'This email could not be sent. The project has been disabled. Please contact support.',
-            },
-          });
+          if (phishingCheck.shouldDisable) {
+            // Disable project immediately
+            await SecurityService.disableProjectForPhishing(
+              email.projectId,
+              formattedEmail.subject,
+              phishingCheck.confidence,
+              'Phishing content detected',
+            );
 
-          throw new UnrecoverableError(`Project ${email.projectId} has been disabled due to a policy violation`);
-        }
-
-        // The contact may have unsubscribed while this job was waiting in Redis.
-        // Wrap the actual SES call so that the fresh subscription read and submit
-        // cannot accidentally drift apart later.
-        const submission = await submitEmailWithSubscriptionCheck(
-          {
-            emailId,
-            sourceType: email.sourceType,
-            templateType: email.template?.type,
-            hasRecipientOverride: Boolean(customHeaders?.['X-Plunk-Recipient-Override']),
-          },
-          () => {
-            sesSubmissionStarted = true;
-            return sendRawEmail({
-              from: {
-                name: fromName,
-                email: fromEmail,
+            // Mark email as failed
+            await prisma.email.update({
+              where: {id: emailId},
+              data: {
+                status: EmailStatus.FAILED,
+                error: 'This email could not be sent. The project has been disabled. Please contact support.',
               },
-              to: typeof recipient === 'string' ? [recipient] : [{name: recipient.name, email: recipient.email}],
-              content: {
-                subject: formattedEmail.subject,
-                html: compiledHtml,
-              },
-              reply: email.replyTo || undefined,
-              headers: outboundHeaders,
-              tracking: shouldTrack,
-              attachments: email.attachments as {filename: string; content: string; contentType: string}[] | null,
             });
-          },
-        );
 
-        if (!submission.submitted) {
-          if (email.campaignId) {
-            await CampaignService.finalizeIfDone(email.campaignId);
+            throw new UnrecoverableError(`Project ${email.projectId} has been disabled due to a policy violation`);
           }
-          return;
-        }
 
-        const {result} = submission;
-        acceptedBySes = {messageId: result.messageId, sentAt: new Date()};
+          // The contact may have unsubscribed while this job was waiting in Redis.
+          // Wrap the actual SES call so that the fresh subscription read and submit
+          // cannot accidentally drift apart later.
+          const submission = await submitEmailWithSubscriptionCheck(
+            {
+              emailId,
+              sourceType: email.sourceType,
+              templateType: email.template?.type,
+              hasRecipientOverride: Boolean(customHeaders?.['X-Plunk-Recipient-Override']),
+            },
+            () => {
+              sesSubmissionStarted = true;
+              return sendRawEmail({
+                from: {
+                  name: fromName,
+                  email: fromEmail,
+                },
+                to: typeof recipient === 'string' ? [recipient] : [{name: recipient.name, email: recipient.email}],
+                content: {
+                  subject: formattedEmail.subject,
+                  html: compiledHtml,
+                },
+                reply: email.replyTo || undefined,
+                headers: outboundHeaders,
+                tracking: shouldTrack,
+                attachments: email.attachments as {filename: string; content: string; contentType: string}[] | null,
+              });
+            },
+          );
+
+          if (!submission.submitted) {
+            if (email.campaignId) {
+              await CampaignService.finalizeIfDone(email.campaignId);
+            }
+            return;
+          }
+
+          const {result} = submission;
+          acceptedBySes = {messageId: result.messageId, sentAt: new Date()};
+          acceptanceCheckpointed = await checkpointSesAcceptance(job, acceptedBySes);
+        }
 
         // Mark as sent with SES message ID
         await prisma.email.update({
@@ -365,6 +404,7 @@ export async function createEmailWorker() {
             error: null,
           },
         });
+        acceptedPersisted = true;
 
         // Record usage for billing (pay-per-email)
         // Uses email ID as idempotency key to prevent double-charging on retries
@@ -380,7 +420,7 @@ export async function createEmailWorker() {
           subject: formattedEmail.subject,
           from: email.from,
           fromName: email.fromName,
-          messageId: result.messageId,
+          messageId: acceptedBySes.messageId,
           emailId: email.id,
           templateId: email.templateId,
           campaignId: email.campaignId,
@@ -410,8 +450,24 @@ export async function createEmailWorker() {
                 error: `Post-send processing failed: ${message}`,
               },
             });
+            acceptedPersisted = true;
+
+            if (email.campaignId) {
+              await CampaignService.finalizeIfDone(email.campaignId);
+            }
           } catch (persistenceError) {
             signale.error(`[EMAIL-PROCESSOR] Failed to persist accepted SES message ${emailId}:`, persistenceError);
+          }
+
+          if (!acceptedPersisted && !acceptanceCheckpointed) {
+            acceptanceCheckpointed = await checkpointSesAcceptance(job, acceptedBySes);
+          }
+
+          if (!acceptedPersisted) {
+            // A checkpointed retry finalizes the known SES message. Without one,
+            // the retry turns the stranded SENDING row into an explicit FAILED
+            // state rather than silently completing or risking a second send.
+            throw error;
           }
 
           throw new UnrecoverableError(`SES accepted email ${emailId}, but post-send processing failed: ${message}`);
