@@ -12,7 +12,9 @@ import {EventService} from '../services/EventService.js';
  * Durable-state maintenance worker.
  *
  * Deletes expired API/SNS claims and reconciles aged event-outbox rows. The
- * grace window keeps the hourly sweep away from normal synchronous dispatch.
+ * five-minute grace window keeps the minutely sweep away from normal
+ * synchronous dispatch while bounding the usual recovery delay below six
+ * minutes.
  */
 
 const BATCH_SIZE = 10000; // Delete in batches to avoid long-held locks
