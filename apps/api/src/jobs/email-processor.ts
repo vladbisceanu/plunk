@@ -5,7 +5,7 @@
 
 import {EmailSourceType, EmailStatus, type TemplateType} from '@plunk/db';
 import type {SendEmailJobData} from '@plunk/types';
-import {type Job, Worker} from 'bullmq';
+import {type Job, UnrecoverableError, Worker} from 'bullmq';
 import signale from 'signale';
 
 import {
@@ -76,6 +76,27 @@ function deriveWorkerConcurrency(rateLimit: number): number {
 }
 
 const UNSUBSCRIBED_ERROR = 'Contact is unsubscribed from marketing emails';
+
+function isExplicitlyRetryableSesFailure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+
+  const {name, $metadata} = error as {
+    name?: string;
+    $metadata?: {httpStatusCode?: number};
+  };
+  const status = $metadata?.httpStatusCode;
+
+  // A signed SES error response establishes that SES rejected this attempt.
+  // Transport errors without a response are ambiguous and must not be retried,
+  // because SES may have accepted the message before the connection failed.
+  return (
+    status === 429 ||
+    (status !== undefined && status >= 500) ||
+    name === 'Throttling' ||
+    name === 'ThrottlingException' ||
+    name === 'TooManyRequestsException'
+  );
+}
 
 /**
  * Re-read subscription state at the last possible point before handing a
@@ -184,6 +205,9 @@ export async function createEmailWorker() {
         return;
       }
 
+      let acceptedBySes: {messageId: string; sentAt: Date} | undefined;
+      let sesSubmissionStarted = false;
+
       try {
         // Update status to sending
         await prisma.email.update({
@@ -288,7 +312,7 @@ export async function createEmailWorker() {
             },
           });
 
-          throw new Error(`Project ${email.projectId} has been disabled due to a policy violation`);
+          throw new UnrecoverableError(`Project ${email.projectId} has been disabled due to a policy violation`);
         }
 
         // The contact may have unsubscribed while this job was waiting in Redis.
@@ -301,8 +325,9 @@ export async function createEmailWorker() {
             templateType: email.template?.type,
             hasRecipientOverride: Boolean(customHeaders?.['X-Plunk-Recipient-Override']),
           },
-          () =>
-            sendRawEmail({
+          () => {
+            sesSubmissionStarted = true;
+            return sendRawEmail({
               from: {
                 name: fromName,
                 email: fromEmail,
@@ -316,7 +341,8 @@ export async function createEmailWorker() {
               headers: outboundHeaders,
               tracking: shouldTrack,
               attachments: email.attachments as {filename: string; content: string; contentType: string}[] | null,
-            }),
+            });
+          },
         );
 
         if (!submission.submitted) {
@@ -327,14 +353,16 @@ export async function createEmailWorker() {
         }
 
         const {result} = submission;
+        acceptedBySes = {messageId: result.messageId, sentAt: new Date()};
 
         // Mark as sent with SES message ID
         await prisma.email.update({
           where: {id: emailId},
           data: {
             status: EmailStatus.SENT,
-            sentAt: new Date(),
-            messageId: result.messageId,
+            sentAt: acceptedBySes.sentAt,
+            messageId: acceptedBySes.messageId,
+            error: null,
           },
         });
 
@@ -366,14 +394,53 @@ export async function createEmailWorker() {
       } catch (error) {
         signale.error(`[EMAIL-PROCESSOR] Failed to send email ${emailId}:`, error);
 
-        // Mark as failed
+        if (acceptedBySes) {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+
+          // SES accepted the message, so another attempt must never submit it
+          // again. Best-effort persistence keeps the delivery truthful even when
+          // a later billing/event/finalization step failed.
+          try {
+            await prisma.email.update({
+              where: {id: emailId},
+              data: {
+                status: EmailStatus.SENT,
+                sentAt: acceptedBySes.sentAt,
+                messageId: acceptedBySes.messageId,
+                error: `Post-send processing failed: ${message}`,
+              },
+            });
+          } catch (persistenceError) {
+            signale.error(`[EMAIL-PROCESSOR] Failed to persist accepted SES message ${emailId}:`, persistenceError);
+          }
+
+          throw new UnrecoverableError(`SES accepted email ${emailId}, but post-send processing failed: ${message}`);
+        }
+
+        const configuredAttempts = Math.max(1, job.opts.attempts ?? 1);
+        const attemptsExhausted = job.attemptsMade + 1 >= configuredAttempts;
+        const hasAmbiguousSesOutcome =
+          sesSubmissionStarted && !acceptedBySes && !isExplicitlyRetryableSesFailure(error);
+        const isTerminal = error instanceof UnrecoverableError || attemptsExhausted || hasAmbiguousSesOutcome;
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        const persistedError = hasAmbiguousSesOutcome
+          ? `SES outcome is unknown; not retried to avoid a duplicate: ${errorMessage}`
+          : errorMessage;
+
+        // Keep retryable failures eligible for the next BullMQ attempt. The
+        // worker's entry guard only processes PENDING rows, so writing FAILED
+        // before attempts are exhausted silently turns the retry into a no-op.
         await prisma.email.update({
           where: {id: emailId},
           data: {
-            status: EmailStatus.FAILED,
-            error: error instanceof Error ? error.message : 'Unknown error',
+            status: isTerminal ? EmailStatus.FAILED : EmailStatus.PENDING,
+            error: persistedError,
           },
         });
+
+        if (hasAmbiguousSesOutcome) {
+          throw new UnrecoverableError(persistedError);
+        }
 
         throw error; // Re-throw to trigger retry
       }

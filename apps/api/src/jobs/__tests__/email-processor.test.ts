@@ -2,7 +2,16 @@ import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {EmailSourceType, EmailStatus, TrackingMode} from '@plunk/db';
 import {toPrismaJson} from '@plunk/types';
 import {createServiceMocks, factories, getPrismaClient} from '../../../../../test/helpers';
-import {submitEmailWithSubscriptionCheck} from '../email-processor';
+import {EventService} from '../../services/EventService.js';
+import {emailQueue} from '../../services/QueueService.js';
+import {createEmailWorker, submitEmailWithSubscriptionCheck} from '../email-processor';
+
+const sesMocks = vi.hoisted(() => ({
+  getSendingQuota: vi.fn(),
+  sendRawEmail: vi.fn(),
+}));
+
+vi.mock('../../services/SESService.js', () => sesMocks);
 
 // Mock MeterService
 vi.mock('../../services/MeterService.js', () => ({
@@ -11,12 +20,37 @@ vi.mock('../../services/MeterService.js', () => ({
   },
 }));
 
+async function waitForEmailStatus(emailId: string, status: EmailStatus) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const email = await getPrismaClient().email.findUniqueOrThrow({where: {id: emailId}});
+    if (email.status === status) return email;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+
+  throw new Error(`Email ${emailId} did not reach ${status}`);
+}
+
+async function waitForJobState(job: {getState(): Promise<string>}, state: string) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if ((await job.getState()) === state) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+
+  throw new Error(`Job did not reach ${state}`);
+}
+
 describe('Email Processor', () => {
   let projectId: string;
   const prisma = getPrismaClient();
   const _serviceMocks = createServiceMocks();
 
   beforeEach(async () => {
+    sesMocks.getSendingQuota.mockReset().mockResolvedValue({
+      maxSendRate: 14,
+      sentLast24Hours: 0,
+      max24HourSend: 200,
+    });
+    sesMocks.sendRawEmail.mockReset().mockResolvedValue({messageId: 'mock-message-id'});
     const {project} = await factories.createUserWithProject({}, {tracking: TrackingMode.ENABLED});
     projectId = project.id;
   });
@@ -218,6 +252,148 @@ describe('Email Processor', () => {
 
       expect(result).toEqual({submitted: false});
       expect(submit).not.toHaveBeenCalled();
+    });
+
+    it('should retry SES after the first failure and succeed on the second attempt', async () => {
+      const contact = await factories.createContact({projectId});
+      const email = await factories.createEmail(projectId, contact.id, {
+        sourceType: EmailSourceType.TRANSACTIONAL,
+        status: EmailStatus.PENDING,
+      });
+      const retryableSesError = Object.assign(new Error('transient SES failure'), {
+        $metadata: {httpStatusCode: 503},
+      });
+      sesMocks.sendRawEmail
+        .mockRejectedValueOnce(retryableSesError)
+        .mockResolvedValueOnce({messageId: 'ses-retry-success'});
+      const worker = await createEmailWorker();
+
+      try {
+        await emailQueue.add(
+          'send-email',
+          {emailId: email.id},
+          {
+            jobId: `retry-success-${email.id}`,
+            attempts: 2,
+            backoff: {type: 'fixed', delay: 10},
+          },
+        );
+
+        await expect(waitForEmailStatus(email.id, EmailStatus.SENT)).resolves.toMatchObject({
+          status: EmailStatus.SENT,
+          messageId: 'ses-retry-success',
+          error: null,
+        });
+      } finally {
+        await worker.close();
+      }
+
+      expect(sesMocks.sendRawEmail).toHaveBeenCalledTimes(2);
+      await expect(prisma.email.findUniqueOrThrow({where: {id: email.id}})).resolves.toMatchObject({
+        status: EmailStatus.SENT,
+        messageId: 'ses-retry-success',
+        error: null,
+      });
+    });
+
+    it('should record FAILED only when SES attempts are exhausted', async () => {
+      const contact = await factories.createContact({projectId});
+      const email = await factories.createEmail(projectId, contact.id, {
+        sourceType: EmailSourceType.TRANSACTIONAL,
+        status: EmailStatus.PENDING,
+      });
+      sesMocks.sendRawEmail.mockRejectedValue(
+        Object.assign(new Error('terminal SES failure'), {$metadata: {httpStatusCode: 503}}),
+      );
+      const worker = await createEmailWorker();
+
+      try {
+        await emailQueue.add(
+          'send-email',
+          {emailId: email.id},
+          {
+            jobId: `retry-exhausted-${email.id}`,
+            attempts: 2,
+            backoff: {type: 'fixed', delay: 10},
+          },
+        );
+
+        await waitForEmailStatus(email.id, EmailStatus.FAILED);
+      } finally {
+        await worker.close();
+      }
+
+      expect(sesMocks.sendRawEmail).toHaveBeenCalledTimes(2);
+      await expect(prisma.email.findUniqueOrThrow({where: {id: email.id}})).resolves.toMatchObject({
+        status: EmailStatus.FAILED,
+        error: 'terminal SES failure',
+      });
+    });
+
+    it('should not retry an ambiguous SES transport failure', async () => {
+      const contact = await factories.createContact({projectId});
+      const email = await factories.createEmail(projectId, contact.id, {
+        sourceType: EmailSourceType.TRANSACTIONAL,
+        status: EmailStatus.PENDING,
+      });
+      sesMocks.sendRawEmail.mockRejectedValue(new Error('socket closed before the response'));
+      const worker = await createEmailWorker();
+
+      try {
+        const job = await emailQueue.add(
+          'send-email',
+          {emailId: email.id},
+          {
+            jobId: `ambiguous-ses-${email.id}`,
+            attempts: 2,
+            backoff: {type: 'fixed', delay: 10},
+          },
+        );
+
+        await waitForJobState(job, 'failed');
+      } finally {
+        await worker.close();
+      }
+
+      expect(sesMocks.sendRawEmail).toHaveBeenCalledOnce();
+      await expect(prisma.email.findUniqueOrThrow({where: {id: email.id}})).resolves.toMatchObject({
+        status: EmailStatus.FAILED,
+        error: 'SES outcome is unknown; not retried to avoid a duplicate: socket closed before the response',
+      });
+    });
+
+    it('should not resubmit an email when post-send processing fails', async () => {
+      const contact = await factories.createContact({projectId});
+      const email = await factories.createEmail(projectId, contact.id, {
+        sourceType: EmailSourceType.TRANSACTIONAL,
+        status: EmailStatus.PENDING,
+      });
+      sesMocks.sendRawEmail.mockResolvedValue({messageId: 'ses-already-accepted'});
+      vi.spyOn(EventService, 'trackEvent').mockRejectedValueOnce(new Error('event persistence failed'));
+      const worker = await createEmailWorker();
+
+      try {
+        const job = await emailQueue.add(
+          'send-email',
+          {emailId: email.id},
+          {
+            jobId: `post-send-failure-${email.id}`,
+            attempts: 2,
+            backoff: {type: 'fixed', delay: 10},
+          },
+        );
+
+        await waitForJobState(job, 'failed');
+      } finally {
+        await worker.close();
+      }
+
+      expect(sesMocks.sendRawEmail).toHaveBeenCalledOnce();
+      await expect(prisma.email.findUniqueOrThrow({where: {id: email.id}})).resolves.toMatchObject({
+        status: EmailStatus.SENT,
+        messageId: 'ses-already-accepted',
+        error: 'Post-send processing failed: event persistence failed',
+      });
     });
   });
 
