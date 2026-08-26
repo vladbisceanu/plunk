@@ -1,7 +1,9 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {EmailSourceType, EmailStatus, TrackingMode} from '@plunk/db';
 import {toPrismaJson} from '@plunk/types';
+import {Job} from 'bullmq';
 import {createServiceMocks, factories, getPrismaClient} from '../../../../../test/helpers';
+import {prisma as runtimePrisma} from '../../database/prisma.js';
 import {EventService} from '../../services/EventService.js';
 import {emailQueue} from '../../services/QueueService.js';
 import {createEmailWorker, submitEmailWithSubscriptionCheck} from '../email-processor';
@@ -327,6 +329,84 @@ describe('Email Processor', () => {
       await expect(prisma.email.findUniqueOrThrow({where: {id: email.id}})).resolves.toMatchObject({
         status: EmailStatus.FAILED,
         error: 'terminal SES failure',
+      });
+    });
+
+    it('should finalize a checkpointed SES acceptance after the database recovers', async () => {
+      const contact = await factories.createContact({projectId});
+      const email = await factories.createEmail(projectId, contact.id, {
+        sourceType: EmailSourceType.TRANSACTIONAL,
+        status: EmailStatus.PENDING,
+      });
+      sesMocks.sendRawEmail.mockImplementationOnce(async () => {
+        // The SENDING write already succeeded. Fail both attempts to persist the
+        // accepted message so the BullMQ retry must recover it from job data.
+        vi.spyOn(runtimePrisma.email, 'update')
+          .mockRejectedValueOnce(new Error('database unavailable'))
+          .mockRejectedValueOnce(new Error('database still unavailable'));
+        return {messageId: 'ses-checkpointed'};
+      });
+      const worker = await createEmailWorker();
+
+      try {
+        await emailQueue.add(
+          'send-email',
+          {emailId: email.id},
+          {
+            jobId: `accepted-checkpoint-${email.id}`,
+            attempts: 2,
+            backoff: {type: 'fixed', delay: 10},
+          },
+        );
+
+        await expect(waitForEmailStatus(email.id, EmailStatus.SENT)).resolves.toMatchObject({
+          status: EmailStatus.SENT,
+          messageId: 'ses-checkpointed',
+        });
+      } finally {
+        await worker.close();
+      }
+
+      expect(sesMocks.sendRawEmail).toHaveBeenCalledOnce();
+    });
+
+    it('should fail visibly when neither the acceptance checkpoint nor database writes succeed', async () => {
+      const contact = await factories.createContact({projectId});
+      const email = await factories.createEmail(projectId, contact.id, {
+        sourceType: EmailSourceType.TRANSACTIONAL,
+        status: EmailStatus.PENDING,
+      });
+      vi.spyOn(Job.prototype, 'updateData')
+        .mockRejectedValueOnce(new Error('redis unavailable'))
+        .mockRejectedValueOnce(new Error('redis still unavailable'));
+      sesMocks.sendRawEmail.mockImplementationOnce(async () => {
+        vi.spyOn(runtimePrisma.email, 'update')
+          .mockRejectedValueOnce(new Error('database unavailable'))
+          .mockRejectedValueOnce(new Error('database still unavailable'));
+        return {messageId: 'ses-uncheckpointed'};
+      });
+      const worker = await createEmailWorker();
+
+      try {
+        await emailQueue.add(
+          'send-email',
+          {emailId: email.id},
+          {
+            jobId: `uncheckpointed-acceptance-${email.id}`,
+            attempts: 2,
+            backoff: {type: 'fixed', delay: 10},
+          },
+        );
+
+        await waitForEmailStatus(email.id, EmailStatus.FAILED);
+      } finally {
+        await worker.close();
+      }
+
+      expect(sesMocks.sendRawEmail).toHaveBeenCalledOnce();
+      await expect(prisma.email.findUniqueOrThrow({where: {id: email.id}})).resolves.toMatchObject({
+        status: EmailStatus.FAILED,
+        error: 'Previous attempt ended without an SES acceptance checkpoint; not retried to avoid a duplicate',
       });
     });
 
