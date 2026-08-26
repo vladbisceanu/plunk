@@ -361,11 +361,21 @@ export class WorkflowExecutionService {
     eventName: string,
     contactId?: string,
     data?: Record<string, unknown>,
+    sourceEventId?: string,
+    assertDispatchOwnership?: () => Promise<void>,
   ): Promise<void> {
-    // Find workflows waiting for this event
+    const errors: unknown[] = [];
+
+    // A durable retry must see both unclaimed waits and waits this same event
+    // already claimed before its continuation failed.
     const waitingExecutions = await prisma.workflowStepExecution.findMany({
       where: {
-        status: StepExecutionStatus.WAITING,
+        OR: sourceEventId
+          ? [
+              {status: StepExecutionStatus.WAITING, resumeEventId: null},
+              {status: StepExecutionStatus.RUNNING, resumeEventId: sourceEventId},
+            ]
+          : [{status: StepExecutionStatus.WAITING}],
         execution: {
           workflow: {projectId},
           ...(contactId ? {contactId} : {}),
@@ -396,44 +406,114 @@ export class WorkflowExecutionService {
       const config = stepExecution.step.config;
 
       if (config && typeof config === 'object' && 'eventName' in config && config.eventName === eventName) {
-        const currentContext =
-          stepExecution.execution.context &&
-          typeof stepExecution.execution.context === 'object' &&
-          !Array.isArray(stepExecution.execution.context)
-            ? (stepExecution.execution.context as Record<string, unknown>)
-            : {};
-        const resumedContext = {...currentContext, ...(data ?? {})};
-        const result = {
-          waitOutcome: WorkflowWaitOutcome.EVENT,
-          eventReceived: true,
-          eventName,
-          ...(data ? {eventData: data} : {}),
-          receivedAt: new Date().toISOString(),
-        };
+        await assertDispatchOwnership?.();
 
-        // Persist the resume payload with the completed wait. A worker restart
-        // after this commit reads the same context for downstream steps.
-        await prisma.$transaction([
-          prisma.workflowStepExecution.update({
-            where: {id: stepExecution.id},
+        try {
+          let result: StepResult;
+
+          if (sourceEventId && stepExecution.resumeEventId === sourceEventId) {
+            if (
+              !stepExecution.output ||
+              typeof stepExecution.output !== 'object' ||
+              Array.isArray(stepExecution.output)
+            ) {
+              throw new Error(`Wait execution ${stepExecution.id} has no durable resume payload`);
+            }
+            result = stepExecution.output as StepResult;
+
+            // processNextSteps may have returned before the wait acknowledgement
+            // was persisted. Its downstream step row is the durable delivery
+            // claim; never replay that step just to repair this wait row.
+            if (await this.waitContinuationWasDelivered(stepExecution, result)) {
+              await prisma.workflowStepExecution.updateMany({
+                where: {
+                  id: stepExecution.id,
+                  status: StepExecutionStatus.RUNNING,
+                  resumeEventId: sourceEventId,
+                },
+                data: {
+                  status: StepExecutionStatus.COMPLETED,
+                  completedAt: new Date(),
+                },
+              });
+              continue;
+            }
+          } else {
+            const currentContext =
+              stepExecution.execution.context &&
+              typeof stepExecution.execution.context === 'object' &&
+              !Array.isArray(stepExecution.execution.context)
+                ? (stepExecution.execution.context as Record<string, unknown>)
+                : {};
+            const resumedContext = {...currentContext, ...(data ?? {})};
+            result = {
+              waitOutcome: WorkflowWaitOutcome.EVENT,
+              eventReceived: true,
+              eventName,
+              ...(data ? {eventData: data} : {}),
+              receivedAt: new Date().toISOString(),
+            };
+
+            // RUNNING is the durable event-vs-timeout claim. The row stays
+            // discoverable by resumeEventId until its continuation succeeds.
+            const claimed = await prisma.$transaction(async tx => {
+              const claim = await tx.workflowStepExecution.updateMany({
+                where: {
+                  id: stepExecution.id,
+                  status: StepExecutionStatus.WAITING,
+                  ...(sourceEventId ? {resumeEventId: null} : {}),
+                },
+                data: {
+                  status: StepExecutionStatus.RUNNING,
+                  ...(sourceEventId ? {resumeEventId: sourceEventId} : {}),
+                  completedAt: null,
+                  output: toPrismaJson(result),
+                },
+              });
+              if (claim.count === 0) return false;
+
+              await tx.workflowExecution.update({
+                where: {id: stepExecution.executionId},
+                data: {context: toPrismaJson(resumedContext)},
+              });
+              return true;
+            });
+
+            // Another event or the timeout won the compare-and-set.
+            if (!claimed) continue;
+          }
+
+          // Cancel any pending timeout job
+          await QueueService.cancelWorkflowTimeout(stepExecution.id);
+
+          // Continue workflow
+          await this.processNextSteps(stepExecution.execution, stepExecution.step, result);
+
+          // Only acknowledge the wait after its continuation returns. If either
+          // operation above fails, the source event retries this claimed row.
+          await prisma.workflowStepExecution.updateMany({
+            where: {
+              id: stepExecution.id,
+              status: StepExecutionStatus.RUNNING,
+              ...(sourceEventId ? {resumeEventId: sourceEventId} : {}),
+            },
             data: {
               status: StepExecutionStatus.COMPLETED,
               completedAt: new Date(),
-              output: toPrismaJson(result),
             },
-          }),
-          prisma.workflowExecution.update({
-            where: {id: stepExecution.executionId},
-            data: {context: toPrismaJson(resumedContext)},
-          }),
-        ]);
-
-        // Cancel any pending timeout job
-        await QueueService.cancelWorkflowTimeout(stepExecution.id);
-
-        // Continue workflow
-        await this.processNextSteps(stepExecution.execution, stepExecution.step, result);
+          });
+        } catch (error) {
+          signale.error(
+            `[WORKFLOW] Failed to resume execution ${stepExecution.executionId} from event ${eventName}:`,
+            error,
+          );
+          errors.push(error);
+        }
       }
+    }
+
+    if (errors.length > 0) {
+      throw new AggregateError(errors, `Event ${eventName} failed ${errors.length} waiting execution(s)`);
     }
   }
 
@@ -1192,16 +1272,7 @@ export class WorkflowExecutionService {
     let nextStep = null;
 
     if (currentStep.type === 'WAIT_FOR_EVENT') {
-      const waitOutcome = stepResult.waitOutcome;
-      const outcomeTransition = transitions.find(t => t.waitOutcome === waitOutcome);
-
-      if (outcomeTransition) {
-        nextStep = outcomeTransition.toStep;
-      } else if (transitions.every(t => t.waitOutcome === null)) {
-        // Compatibility for rows created before the wait-outcome migration and
-        // direct test fixtures: their single transition handled either result.
-        nextStep = transitions[0]?.toStep ?? null;
-      }
+      nextStep = this.getWaitContinuationStep(currentStep, stepResult);
     }
 
     for (const transition of currentStep.type === 'WAIT_FOR_EVENT' ? [] : transitions) {
@@ -1259,6 +1330,55 @@ export class WorkflowExecutionService {
     // Process the next step
     // All steps are processed immediately - DELAY and WAIT_FOR_EVENT will pause the workflow internally
     await this.processStepExecution(execution.id, nextStep.id);
+  }
+
+  /**
+   * Resolve a wait's event/timeout route without mutating execution state.
+   */
+  private static getWaitContinuationStep(
+    currentStep: WorkflowStepWithTransitions,
+    stepResult: StepResult,
+  ): WorkflowStep | null {
+    const transitions = currentStep.outgoingTransitions || [];
+    const outcomeTransition = transitions.find(t => t.waitOutcome === stepResult.waitOutcome);
+
+    if (outcomeTransition) return outcomeTransition.toStep;
+
+    // Compatibility for rows created before the wait-outcome migration and
+    // direct test fixtures: their single transition handled either result.
+    return transitions.every(t => t.waitOutcome === null) ? (transitions[0]?.toStep ?? null) : null;
+  }
+
+  /**
+   * A downstream step row means this wait already handed control to the engine.
+   * If there is no route, the terminal workflow update is the delivery proof.
+   */
+  private static async waitContinuationWasDelivered(
+    waitExecution: WorkflowStepExecution & {
+      execution: WorkflowExecution;
+      step: WorkflowStepWithTransitions;
+    },
+    result: StepResult,
+  ): Promise<boolean> {
+    const nextStep = this.getWaitContinuationStep(waitExecution.step, result);
+
+    if (nextStep) {
+      const downstreamClaim = await prisma.workflowStepExecution.findFirst({
+        where: {
+          executionId: waitExecution.executionId,
+          stepId: nextStep.id,
+          createdAt: {gte: waitExecution.updatedAt},
+        },
+        select: {id: true},
+      });
+      return downstreamClaim !== null;
+    }
+
+    const execution = await prisma.workflowExecution.findUnique({
+      where: {id: waitExecution.executionId},
+      select: {currentStepId: true, status: true},
+    });
+    return execution?.currentStepId === null && execution.status === WorkflowExecutionStatus.COMPLETED;
   }
 
   /**

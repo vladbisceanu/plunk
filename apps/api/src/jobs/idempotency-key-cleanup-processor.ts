@@ -72,10 +72,16 @@ export async function processCleanup(job: Job<IdempotencyKeyCleanupJobData>): Pr
       await new Promise(resolve => setTimeout(resolve, 100));
     }
 
+    const reconciliationStartedAt = new Date();
     const pendingEvents = await prisma.event.findMany({
       where: {
         processedAt: null,
+        dispatchFailedAt: null,
         createdAt: {lt: new Date(Date.now() - EVENT_DISPATCH_GRACE_MS)},
+        AND: [
+          {OR: [{nextDispatchAt: null}, {nextDispatchAt: {lte: reconciliationStartedAt}}]},
+          {OR: [{dispatchLeaseExpiresAt: null}, {dispatchLeaseExpiresAt: {lte: reconciliationStartedAt}}]},
+        ],
       },
       select: {id: true},
       orderBy: {createdAt: 'asc'},
@@ -88,8 +94,8 @@ export async function processCleanup(job: Job<IdempotencyKeyCleanupJobData>): Pr
         await EventService.dispatchStoredEvent(event.id);
         dispatchedEvents += 1;
       } catch (error) {
-        // Keep processedAt null. A later sweep can retry without replaying the
-        // external request that originally committed this event.
+        // dispatchStoredEvent recorded backoff or terminal failure. Keep the
+        // event durable without letting it monopolize every sweep.
         signale.error(`[EVENT-OUTBOX] Failed to dispatch event ${event.id}:`, error);
       }
     }
