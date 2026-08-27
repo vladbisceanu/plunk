@@ -32,6 +32,7 @@ export class Actions {
    * - event: string (required) - Event name
    * - email: string (required) - Contact email
    * - subscribed: boolean (optional) - Contact subscription status (only updates if explicitly specified)
+   * - preserveExistingSubscription: boolean (optional) - Apply `subscribed` only when creating the contact
    * - data: object (optional) - Event and contact data
    *   - Simple values are saved to contact (persistent)
    *   - {value: any, persistent: false} are only available to workflows (non-persistent)
@@ -61,7 +62,7 @@ export class Actions {
     const auth = res.locals.auth;
 
     // Zod validation - errors automatically handled by global error handler
-    const {event, email, subscribed, data} = ActionSchemas.track.parse(req.body);
+    const {event, email, subscribed, preserveExistingSubscription, data} = ActionSchemas.track.parse(req.body);
 
     // Prevent manual tracking of reserved system events
     if (EventService.isReservedEvent(event)) {
@@ -87,6 +88,8 @@ export class Actions {
       email,
       data as Record<string, unknown> | undefined,
       subscribed,
+      true,
+      {preserveExistingSubscription},
     );
 
     // Track the event with ALL data (persistent + non-persistent)

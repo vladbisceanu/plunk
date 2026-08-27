@@ -58,6 +58,48 @@ describe('POST /v1/track durability', () => {
     expect((await prisma.event.findUniqueOrThrow({where: {id: response.body.data.event}})).processedAt).not.toBeNull();
   });
 
+  it('creates a pending contact without changing an existing preference', async () => {
+    const subscribed = await factories.createContact({
+      projectId,
+      email: 'active-opt-in@example.com',
+      subscribed: true,
+    });
+    const unsubscribed = await factories.createContact({
+      projectId,
+      email: 'suppressed-opt-in@example.com',
+      subscribed: false,
+    });
+    const app = createTrackApp(projectId);
+    const payload = {
+      event: 'signup.pending',
+      subscribed: false,
+      preserveExistingSubscription: true,
+    };
+
+    const [activeResponse, suppressedResponse, newResponse] = await Promise.all([
+      request(app)
+        .post('/v1/track')
+        .send({...payload, email: subscribed.email}),
+      request(app)
+        .post('/v1/track')
+        .send({...payload, email: unsubscribed.email}),
+      request(app)
+        .post('/v1/track')
+        .send({...payload, email: 'new-opt-in@example.com'}),
+    ]);
+
+    expect([activeResponse.status, suppressedResponse.status, newResponse.status]).toEqual([200, 200, 200]);
+    expect((await prisma.contact.findUniqueOrThrow({where: {id: subscribed.id}})).subscribed).toBe(true);
+    expect((await prisma.contact.findUniqueOrThrow({where: {id: unsubscribed.id}})).subscribed).toBe(false);
+    expect(
+      (
+        await prisma.contact.findUniqueOrThrow({
+          where: {projectId_email: {projectId, email: 'new-opt-in@example.com'}},
+        })
+      ).subscribed,
+    ).toBe(false);
+  });
+
   it('durably accepts a twelve-request first-contact burst with one active execution', async () => {
     const email = 'first-contact-burst@example.com';
     const concurrency = 12;
