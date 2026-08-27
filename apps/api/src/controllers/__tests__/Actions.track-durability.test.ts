@@ -58,6 +58,76 @@ describe('POST /v1/track durability', () => {
     expect((await prisma.event.findUniqueOrThrow({where: {id: response.body.data.event}})).processedAt).not.toBeNull();
   });
 
+  it('durably accepts a twelve-request first-contact burst with one active execution', async () => {
+    const email = 'first-contact-burst@example.com';
+    const concurrency = 12;
+    const workflow = await factories.createWorkflow({
+      projectId,
+      enabled: true,
+      allowReentry: true,
+      triggerType: 'EVENT',
+      triggerConfig: {eventName: 'burst.started'},
+    });
+    const triggerStep = await prisma.workflowStep.findFirstOrThrow({
+      where: {workflowId: workflow.id, type: 'TRIGGER'},
+    });
+    const delayStep = await prisma.workflowStep.create({
+      data: {
+        workflowId: workflow.id,
+        type: 'DELAY',
+        name: 'Keep burst execution active',
+        position: {x: 100, y: 0},
+        config: {amount: 1, unit: 'minutes'},
+      },
+    });
+    await prisma.workflowTransition.create({
+      data: {fromStepId: triggerStep.id, toStepId: delayStep.id},
+    });
+
+    const originalFindFirst = servicePrisma.contact.findFirst.bind(servicePrisma.contact);
+    let initialLookups = 0;
+    let releaseInitialLookups!: () => void;
+    const allInitialLookupsStarted = new Promise<void>(resolve => {
+      releaseInitialLookups = resolve;
+    });
+    const contactLookup = vi.spyOn(servicePrisma.contact, 'findFirst').mockImplementation(async args => {
+      if (args.where?.projectId === projectId && args.where?.email === email) {
+        initialLookups += 1;
+        if (initialLookups === concurrency) releaseInitialLookups();
+        await allInitialLookupsStarted;
+        return null;
+      }
+
+      return originalFindFirst(args);
+    });
+
+    const responses = await (async () => {
+      try {
+        const app = createTrackApp(projectId);
+        return await Promise.all(
+          Array.from({length: concurrency}, (_, index) =>
+            request(app)
+              .post('/v1/track')
+              .send({event: 'burst.started', email, data: {request: index}}),
+          ),
+        );
+      } finally {
+        contactLookup.mockRestore();
+      }
+    })();
+
+    expect(responses.map(response => response.status)).toEqual(Array(concurrency).fill(200));
+    expect(new Set(responses.map(response => response.body.data.contact))).toHaveLength(1);
+    expect(new Set(responses.map(response => response.body.data.event))).toHaveLength(concurrency);
+    expect(await prisma.contact.count({where: {projectId, email}})).toBe(1);
+    expect(await prisma.event.count({where: {projectId, name: 'burst.started'}})).toBe(concurrency);
+    expect(
+      await prisma.workflowExecution.count({
+        where: {workflowId: workflow.id, status: {in: ['RUNNING', 'WAITING']}},
+      }),
+    ).toBe(1);
+  });
+
   it('acknowledges a stored event when dispatch fails, then reconciles it once', async () => {
     const workflow = await factories.createWorkflow({
       projectId,
