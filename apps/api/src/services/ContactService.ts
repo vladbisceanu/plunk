@@ -6,6 +6,14 @@ import {prisma} from '../database/prisma.js';
 import {HttpException} from '../exceptions/index.js';
 import {EventService} from './EventService.js';
 
+export interface ContactUpsertOptions {
+  /**
+   * Apply `subscribed` only when this call creates the contact. Existing and
+   * concurrently elected contacts keep their stored subscription state.
+   */
+  preserveExistingSubscription?: boolean;
+}
+
 export class ContactService {
   /**
    * Normalize an email address for storage and lookup.
@@ -317,6 +325,7 @@ export class ContactService {
     data?: Record<string, unknown>,
     subscribed?: boolean,
     defaultSubscribed: boolean = true,
+    options: ContactUpsertOptions = {},
   ): Promise<Contact> {
     const normalizedEmail = ContactService.normalizeEmail(email);
 
@@ -339,7 +348,7 @@ export class ContactService {
           },
         });
 
-        if (subscribed === undefined) return updated;
+        if (subscribed === undefined || options.preserveExistingSubscription) return updated;
 
         await ContactService.applySubscriptionChange(projectId, updated.id, subscribed);
         return prisma.contact.findUniqueOrThrow({where: {id: updated.id}});
@@ -376,7 +385,7 @@ export class ContactService {
             // request won the insert. An explicit opt-out is monotonic and may
             // safely win the race, but never replay stale contact data or a
             // true/default subscription value over the elected row.
-            if (subscribed === false) {
+            if (subscribed === false && !options.preserveExistingSubscription) {
               await ContactService.applySubscriptionChange(projectId, elected.id, false);
               return prisma.contact.findUniqueOrThrow({where: {id: elected.id}});
             }

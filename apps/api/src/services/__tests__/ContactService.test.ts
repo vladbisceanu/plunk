@@ -242,6 +242,107 @@ describe('ContactService - Duplicate Prevention & Data Merging', () => {
         }),
       ).toBe(1);
     });
+
+    it('should apply a create-only subscription value without changing existing preferences', async () => {
+      const subscribed = await ContactService.upsert(
+        projectId,
+        'already-subscribed@example.com',
+        {source: 'existing'},
+        true,
+      );
+      const unsubscribed = await ContactService.upsert(
+        projectId,
+        'already-unsubscribed@example.com',
+        {source: 'existing'},
+        false,
+      );
+
+      const [preservedSubscribed, preservedUnsubscribed, createdPending] = await Promise.all([
+        ContactService.upsert(projectId, subscribed.email, {attempt: 'repeat opt-in'}, false, true, {
+          preserveExistingSubscription: true,
+        }),
+        ContactService.upsert(projectId, unsubscribed.email, {attempt: 'suppressed opt-in'}, false, true, {
+          preserveExistingSubscription: true,
+        }),
+        ContactService.upsert(projectId, 'new-pending@example.com', {attempt: 'first opt-in'}, false, true, {
+          preserveExistingSubscription: true,
+        }),
+      ]);
+
+      expect(preservedSubscribed.subscribed).toBe(true);
+      expect(preservedUnsubscribed.subscribed).toBe(false);
+      expect(createdPending.subscribed).toBe(false);
+      expect(
+        await prisma.event.count({
+          where: {
+            projectId,
+            contactId: subscribed.id,
+            name: 'contact.unsubscribed',
+          },
+        }),
+      ).toBe(0);
+    });
+
+    it('should preserve the elected subscription state when a create-only upsert loses the first-contact race', async () => {
+      const email = 'create-only-race@example.com';
+      const originalFindFirst = servicePrisma.contact.findFirst.bind(servicePrisma.contact);
+      const originalCreate = servicePrisma.contact.create.bind(servicePrisma.contact);
+      let initialLookups = 0;
+      let releaseInitialLookups!: () => void;
+      const bothInitialLookupsStarted = new Promise<void>(resolve => {
+        releaseInitialLookups = resolve;
+      });
+      let releaseCreateOnlyAttempt!: () => void;
+      const subscribedContactCreated = new Promise<void>(resolve => {
+        releaseCreateOnlyAttempt = resolve;
+      });
+
+      const contactLookup = vi.spyOn(servicePrisma.contact, 'findFirst').mockImplementation(async args => {
+        if (args.where?.projectId === projectId && args.where?.email === email) {
+          initialLookups += 1;
+          if (initialLookups === 2) releaseInitialLookups();
+          await bothInitialLookupsStarted;
+          return null;
+        }
+
+        return originalFindFirst(args);
+      });
+      const contactCreate = vi.spyOn(servicePrisma.contact, 'create').mockImplementation(async args => {
+        if (args.data.projectId === projectId && args.data.email === email && args.data.subscribed === false) {
+          await subscribedContactCreated;
+        }
+
+        const contact = await originalCreate(args);
+        if (args.data.projectId === projectId && args.data.email === email && args.data.subscribed === true) {
+          releaseCreateOnlyAttempt();
+        }
+        return contact;
+      });
+
+      try {
+        const contacts = await Promise.all([
+          ContactService.upsert(projectId, email, {source: 'winner'}, true),
+          ContactService.upsert(projectId, email, {source: 'create-only loser'}, false, true, {
+            preserveExistingSubscription: true,
+          }),
+        ]);
+        expect(new Set(contacts.map(contact => contact.id))).toHaveLength(1);
+      } finally {
+        contactLookup.mockRestore();
+        contactCreate.mockRestore();
+      }
+
+      const stored = await prisma.contact.findUniqueOrThrow({
+        where: {projectId_email: {projectId, email}},
+      });
+      expect(stored.subscribed).toBe(true);
+      expect(stored.data).toEqual({source: 'winner'});
+      expect(
+        await prisma.event.count({
+          where: {projectId, contactId: stored.id, name: 'contact.unsubscribed'},
+        }),
+      ).toBe(0);
+    });
   });
 
   describe('Email Normalization (case-insensitive find-or-create)', () => {
