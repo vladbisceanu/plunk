@@ -82,18 +82,11 @@ export class Domains {
       });
     }
 
-    try {
-      const newDomain = await DomainService.addDomain(projectId, domain);
+    const newDomain = await DomainService.addDomain(projectId, domain);
 
-      await redis.del(Keys.Domain.project(projectId));
+    await redis.del(Keys.Domain.project(projectId));
 
-      return res.status(201).json(newDomain);
-    } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({error: error.message});
-      }
-      throw error;
-    }
+    return res.status(201).json(newDomain);
   }
 
   /**
