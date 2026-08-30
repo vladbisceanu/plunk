@@ -14,13 +14,50 @@ interface TypedSchema extends ZodSchema {
 
 interface ApiResponse {
   message?: string;
-  error?: {
-    message?: string;
-    code?: string;
-    [key: string]: unknown;
-  };
+  error?:
+    | string
+    | {
+        message?: string;
+        code?: string;
+        [key: string]: unknown;
+      };
 
   [key: string]: unknown;
+}
+
+async function readResponse<T>(response: Response): Promise<T> {
+  if (response.status === 204) {
+    return {} as T;
+  }
+
+  let res: ApiResponse;
+  try {
+    res = (await response.json()) as ApiResponse;
+  } catch (error) {
+    if (response.ok) {
+      throw error;
+    }
+    throw new Error('Something went wrong!');
+  }
+
+  if (response.status >= 400) {
+    const structuredError = typeof res.error === 'object' ? res.error : undefined;
+
+    if (structuredError?.code === 'EMAIL_VERIFICATION_REQUIRED') {
+      if (typeof window !== 'undefined' && !window.location.href.includes('/auth/verify-email')) {
+        window.location.href = '/auth/verify-email';
+      }
+      throw new Error(structuredError.message ?? 'Please verify your email address to continue');
+    }
+
+    const errorMessage =
+      (typeof res.error === 'string' ? res.error : structuredError?.message) ??
+      res.message ??
+      'Something went wrong!';
+    throw new Error(errorMessage);
+  }
+
+  return res as T;
 }
 
 export class network {
@@ -49,29 +86,7 @@ export class network {
       credentials: 'include',
     });
 
-    // Handle 204 No Content responses (no body to parse)
-    if (response.status === 204) {
-      return {} as T;
-    }
-
-    const res = (await response.json()) as ApiResponse;
-
-    if (response.status >= 400) {
-      // Check if this is an email verification required error
-      if (res.error?.code === 'EMAIL_VERIFICATION_REQUIRED') {
-        // Redirect to verification page
-        if (typeof window !== 'undefined' && !window.location.href.includes('/auth/verify-email')) {
-          window.location.href = '/auth/verify-email';
-        }
-        throw new Error(res.error.message ?? 'Please verify your email address to continue');
-      }
-
-      // Extract error message from standardized error response or fall back to direct message property
-      const errorMessage = res.error?.message ?? res.message ?? 'Something went wrong!';
-      throw new Error(errorMessage);
-    }
-
-    return res as T;
+    return readResponse<T>(response);
   }
 
   /**
@@ -97,23 +112,6 @@ export class network {
       credentials: 'include',
     });
 
-    const res = (await response.json()) as ApiResponse;
-
-    if (response.status >= 400) {
-      // Check if this is an email verification required error
-      if (res.error?.code === 'EMAIL_VERIFICATION_REQUIRED') {
-        // Redirect to verification page
-        if (typeof window !== 'undefined') {
-          window.location.href = '/auth/verify-email';
-        }
-        throw new Error(res.error.message ?? 'Please verify your email address to continue');
-      }
-
-      // Extract error message from standardized error response or fall back to direct message property
-      const errorMessage = res.error?.message ?? res.message ?? 'Something went wrong!';
-      throw new Error(errorMessage);
-    }
-
-    return res as T;
+    return readResponse<T>(response);
   }
 }
